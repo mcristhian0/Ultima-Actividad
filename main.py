@@ -2,10 +2,35 @@ from fastapi import FastAPI
 from fastapi import HTTPException
 from pydantic import BaseModel, EmailStr, StringConstraints, Field, field_validator
 from typing import Annotated
-from datetime import date
+from datetime import date, timedelta, datetime
 import mysql.connector
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi import Depends, status
 
-app = FastAPI()
+# app = FastAPI()
+app = FastAPI(
+    title="Mi API",
+    description="Documentación organizada por módulos",
+    version="1.0.0",
+    openapi_tags=[
+        {"name": "usuario", "description": "Operaciones con usuarios"},
+        {"name": "producto", "description": "Gestión de productos"},
+        {"name": "cliente", "description": "Administración de clientes"},
+        {"name": "venta", "description": "Control de ventas"},
+        {"name": "autenticador", "description": "Login y autenticación"},
+    ]
+)
+
+
+# Configuración JWT
+SECRET_KEY = "supersecretkeyjwt123"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")
 
 try:
     db_config = mysql.connector.connect(
@@ -20,6 +45,7 @@ except mysql.connector.Error as err:
     print(f"Error al conectar a la base de datos: {err}")
 
 mycursor = db_config.cursor()
+
 
 #* ----------- USUARIO Model-----------
 class Usuario(BaseModel):
@@ -68,78 +94,80 @@ class Venta(BaseModel):
     precio_unitario: float
     total: float
 
+#* ----------- AUTENTICACIÓN Model -----------
+class RegisterModel(BaseModel):
+    nombre: str
+    email: EmailStr
+    passwd: str
 
-# Create tables if they do not exist
-mycursor.execute("""
-CREATE TABLE IF NOT EXISTS usuario (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    username VARCHAR(50) NOT NULL,
-    email VARCHAR(100) NOT NULL UNIQUE,
-    password VARCHAR(255) NOT NULL,
-    cargo VARCHAR(50) NOT NULL
-)
-""")
+class LoginModel(BaseModel):
+    email: EmailStr
+    passwd: str
 
-mycursor.execute("""
-CREATE TABLE IF NOT EXISTS cliente (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    nombre VARCHAR(100) NOT NULL,
-    nit VARCHAR(20) NOT NULL UNIQUE
-)
-""")
 
-mycursor.execute("""
-CREATE TABLE IF NOT EXISTS producto (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    producto VARCHAR(100) NOT NULL,
-    precio_compra DECIMAL(10, 2) NOT NULL,
-    precio_venta DECIMAL(10, 2) NOT NULL,
-    stock INT NOT NULL
-)
-""")
 
-mycursor.execute("""
-CREATE TABLE IF NOT EXISTS venta (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    fecha DATE NOT NULL,
-    producto_id INT NOT NULL,
-    cliente_id INT NOT NULL,
-    usuario_id INT NOT NULL,
-    cantidad INT NOT NULL,
-    precio_unitario DECIMAL(10, 2) NOT NULL,
-    total DECIMAL(10, 2) NOT NULL,
-    FOREIGN KEY (producto_id) REFERENCES producto(id),
-    FOREIGN KEY (cliente_id) REFERENCES cliente(id),
-    FOREIGN KEY (usuario_id) REFERENCES usuario(id)
-)
-""")
+#* ----------- Logica de autenticacion y hasheo de passwd -----------
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
 
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: timedelta | None = None):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+
+
+def get_current_user(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="No se pudo validar las credenciales",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+    mycursor.execute("SELECT id, nombre, email FROM autenticator WHERE email = %s", (email,))
+    user = mycursor.fetchone()
+    if user is None:
+        raise credentials_exception
+    return {"id": user[0], "nombre": user[1], "email": user[2]}
+
+# --------- FIN Auth -------------
 
 #! -------- GET ALL -------------
 #* Endpoint para obtener todos los usuarios
-@app.get("/usuario")
+@app.get("/usuarios", tags=["usuario"])
 def get_usuarios():
     mycursor.execute("SELECT * FROM usuario")
     usuarios = mycursor.fetchall()
     return {"usuarios": usuarios}
 
 #* Endpoint para obtener todos los clientes
-@app.get("/cliente")
+@app.get("/clientes", tags=["cliente"])
 def get_clientes():
     mycursor.execute("SELECT * FROM cliente")
     clientes = mycursor.fetchall()
     return {"clientes": clientes}
 
 #* Endpoint para obtener todos los productos
-@app.get("/producto")
+@app.get("/productos", tags=["producto"])
 def get_productos():
     mycursor.execute("SELECT * FROM producto")
     productos = mycursor.fetchall()
     return {"productos": productos}
 
-#* Endpoint para obtener todas las ventas
-@app.get("/venta")
-def get_ventas():
+#* Endpoint para obtener todas las ventas (protegido)
+@app.get("/ventas", tags=["venta"])
+def get_ventas(current_user: dict = Depends(get_current_user)):
     mycursor.execute("SELECT * FROM venta")
     ventas = mycursor.fetchall()
     return {"ventas": ventas}
@@ -147,7 +175,7 @@ def get_ventas():
 
 #! -------- GET BY ID -------------
 #* Endpoint para obtener un usuario por ID
-@app.get("/usuario/{id}")
+@app.get("/usuarios/{id}", tags=["usuario"])
 def get_usuario(id: int):
     mycursor.execute("SELECT * FROM usuario WHERE id = %s", (id,))
     usuario = mycursor.fetchone()
@@ -156,7 +184,7 @@ def get_usuario(id: int):
     return {"message": "Usuario no encontrado"} 
 
 #* Endpoint para obtener un cliente por ID
-@app.get("/cliente/{id}")
+@app.get("/clientes/{id}", tags=["cliente"])
 def get_cliente(id: int):
     mycursor.execute("SELECT * FROM cliente WHERE id = %s", (id,))
     cliente = mycursor.fetchone()
@@ -166,7 +194,7 @@ def get_cliente(id: int):
 
 
 #* Endpoint para obtener un producto por ID
-@app.get("/producto/{id}")
+@app.get("/productos/{id}", tags=["producto"])
 def get_producto(id: int):
     mycursor.execute("SELECT * FROM producto WHERE id = %s", (id,))
     producto = mycursor.fetchone()
@@ -175,9 +203,9 @@ def get_producto(id: int):
     return {"message": "Producto no encontrado"}
 
 
-#* Endpoint para obtener una venta por ID
-@app.get("/venta/{id}")
-def get_venta(id: int):
+#* Endpoint para obtener una venta por ID (protegido)
+@app.get("/ventas/{id}", tags=["venta"])
+def get_venta(id: int, current_user: dict = Depends(get_current_user)):
     mycursor.execute("SELECT * FROM venta WHERE id = %s", (id,))
     venta = mycursor.fetchone()
     if venta:
@@ -188,7 +216,7 @@ def get_venta(id: int):
 
 #! ------- POST ALL -------------
 #* Endpoint para crear un nuevo usuario
-@app.post("/usuario")
+@app.post("/usuarios", tags=["usuario"])
 def create_usuario(usuario: Usuario):
     sql = "INSERT INTO usuario (username, email, password, cargo) VALUES (%s, %s, %s, %s)"
     val = (usuario.username, usuario.email, usuario.password, usuario.cargo)
@@ -200,7 +228,7 @@ def create_usuario(usuario: Usuario):
     return {"message": "Usuario creado exitosamente", "usuario": usuario}
 
 #* Endpoint para crear un nuevo cliente
-@app.post("/cliente")
+@app.post("/clientes", tags=["cliente"])
 def create_cliente(cliente: Cliente):
     sql = "INSERT INTO cliente (nombre, nit) VALUES (%s, %s)"
     val = (cliente.nombre, cliente.nit)
@@ -212,7 +240,7 @@ def create_cliente(cliente: Cliente):
     return {"message": "Cliente creado exitosamente", "cliente": cliente}
 
 #* Endpoint para crear un nuevo producto
-@app.post("/producto")
+@app.post("/productos", tags=["producto"])
 def create_producto(producto: Producto):
     sql = "INSERT INTO producto (producto, precio_compra, precio_venta, stock) VALUES (%s, %s, %s, %s)"
     val = (producto.producto, producto.precio_compra, producto.precio_venta, producto.stock)
@@ -223,22 +251,33 @@ def create_producto(producto: Producto):
         return {"error": f"Error al insertar producto: {err}"}
     return {"message": "Producto creado exitosamente", "producto": producto}
 
-#* Endpoint para crear una nueva venta
-@app.post("/venta")
-def create_venta(venta: Venta):
-    sql = "INSERT INTO venta (fecha, producto_id, cliente_id, usuario_id, cantidad, precio_unitario, total) VALUES (%s, %s, %s, %s, %s, %s, %s)"
-    val = (venta.fecha, venta.producto_id, venta.cliente_id, venta.usuario_id, venta.cantidad, venta.precio_unitario, venta.total)
+#* Endpoint para registrar usuario en autenticator
+@app.post("/auth/register", tags=["autenticador"])
+def register(user: RegisterModel):
+    hashed_password = get_password_hash(user.passwd)
+    sql = "INSERT INTO autenticator (nombre, email, passwd) VALUES (%s, %s, %s)"
+    val = (user.nombre, user.email, hashed_password)
     try:
         mycursor.execute(sql, val)
         db_config.commit()
     except mysql.connector.Error as err:
-        return {"error": f"Error al insertar venta: {err}"}
-    return {"message": "Venta creada exitosamente", "venta": venta}
+        return {"error": f"Error al registrar: {err}"}
+    return {"message": "Usuario registrado exitosamente"}
+
+# Endpoint para login y obtener token
+@app.post("/auth/login", tags=["autenticador"])
+def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    mycursor.execute("SELECT id, nombre, email, passwd FROM autenticator WHERE email = %s", (form_data.username,))
+    user = mycursor.fetchone()
+    if not user or not verify_password(form_data.password, user[3]):
+        raise HTTPException(status_code=400, detail="Email o contraseña incorrectos")
+    access_token = create_access_token(data={"sub": user[2]})
+    return {"access_token": access_token, "token_type": "bearer"}
 
 
 #! --------- PUT ALL -------------
 #* Endpoint para actualizar un usuario
-@app.put("/usuario/{id}")
+@app.put("/usuarios/{id}", tags=["usuario"])
 def update_usuario(id: int, usuario: Usuario):
     sql = "UPDATE usuario SET username = %s, email = %s, password = %s, cargo = %s WHERE id = %s"
     val = (usuario.username, usuario.email, usuario.password, usuario.cargo, id)
@@ -252,7 +291,7 @@ def update_usuario(id: int, usuario: Usuario):
     return {"message": "No se encontró el usuario a actualizar"}
 
 #* Endpoint para actualizar un cliente
-@app.put("/cliente/{id}")
+@app.put("/clientes/{id}", tags=["cliente"])
 def update_cliente(id: int, cliente: Cliente):
     sql = "UPDATE cliente SET nombre = %s, nit = %s WHERE id = %s"
     val = (cliente.nombre, cliente.nit, id)
@@ -266,7 +305,7 @@ def update_cliente(id: int, cliente: Cliente):
     return {"message": "No se encontró el cliente a actualizar"}
 
 #* Endpoint para actualizar un producto
-@app.put("/producto/{id}")
+@app.put("/productos/{id}", tags=["producto"])
 def update_producto(id: int, producto: Producto):
     sql = "UPDATE producto SET producto = %s, precio_compra = %s, precio_venta = %s, stock = %s WHERE id = %s"
     val = (producto.producto, producto.precio_compra, producto.precio_venta, producto.stock, id)
@@ -279,9 +318,9 @@ def update_producto(id: int, producto: Producto):
         return {"message": "Producto actualizado exitosamente", "producto": producto}
     return {"message": "No se encontró el producto a actualizar"}
 
-#* Endpoint para actualizar una venta
-@app.put("/venta/{id}")
-def update_venta(id: int, venta: Venta):
+#* Endpoint para actualizar una venta (protegido)
+@app.put("/ventas/{id}", tags=["venta"])
+def update_venta(id: int, venta: Venta, current_user: dict = Depends(get_current_user)):
     sql = "UPDATE venta SET fecha = %s, producto_id = %s, cliente_id = %s, usuario_id = %s, cantidad = %s, precio_unitario = %s, total = %s WHERE id = %s"
     val = (venta.fecha, venta.producto_id, venta.cliente_id, venta.usuario_id, venta.cantidad, venta.precio_unitario, venta.total, id)
     try:
@@ -297,7 +336,7 @@ def update_venta(id: int, venta: Venta):
 
 #! ----------DELETE ALL --------------
 #* Endpoint para eliminar un usuario
-@app.delete("/usuario/{id}")
+@app.delete("/usuarios/{id}", tags=["usuario"])
 def delete_usuario(id: int):
     sql = "DELETE FROM usuario WHERE id = %s"
     mycursor.execute(sql, (id,))
@@ -308,7 +347,7 @@ def delete_usuario(id: int):
         return {"message": "No se encontró el usuario a eliminar"}
 
 #* Endpoint para eliminar un cliente
-@app.delete("/cliente/{id}")
+@app.delete("/clientes/{id}", tags=["cliente"])
 def delete_cliente(id: int):
     sql = "DELETE FROM cliente WHERE id = %s"
     mycursor.execute(sql, (id,))
@@ -319,7 +358,7 @@ def delete_cliente(id: int):
         return {"message": "No se encontró el cliente a eliminar"}
 
 #* Endpoint para eliminar un producto
-@app.delete("/producto/{id}")
+@app.delete("/productos/{id}", tags=["producto"])
 def delete_producto(id: int):
     sql = "DELETE FROM producto WHERE id = %s"
     mycursor.execute(sql, (id,))
@@ -329,9 +368,9 @@ def delete_producto(id: int):
     else:
         return {"message": "No se encontró el producto a eliminar"}
 
-#* Endpoint para eliminar una venta
-@app.delete("/venta/{id}")
-def delete_venta(id: int):
+#* Endpoint para eliminar una venta (protegido)
+@app.delete("/ventas/{id}", tags=["venta"])
+def delete_venta(id: int, current_user: dict = Depends(get_current_user)):
     sql = "DELETE FROM venta WHERE id = %s"
     mycursor.execute(sql, (id,))
     db_config.commit()
