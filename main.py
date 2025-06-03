@@ -1,15 +1,13 @@
-from fastapi import FastAPI
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel, EmailStr, StringConstraints, Field, field_validator
 from typing import Annotated
-from datetime import date, timedelta, datetime
+from datetime import date
+from Autenticator.auth import register as auth_register, login as auth_login, get_current_user
+from Db.db_config import get_db_cursor
 import mysql.connector
-from jose import JWTError, jwt
-from passlib.context import CryptContext
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from fastapi import Depends, status
+from fastapi.security import OAuth2PasswordRequestForm
 
-# app = FastAPI()
+
 app = FastAPI(
     title="Mi API",
     description="Documentación organizada por módulos",
@@ -23,34 +21,16 @@ app = FastAPI(
     ]
 )
 
+mycursor, db_config = get_db_cursor()
 
-# Configuración JWT
-SECRET_KEY = "supersecretkeyjwt123"
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")
 
-try:
-    db_config = mysql.connector.connect(
-        host="localhost",
-        user="root",
-        password="12345678",
-        database="ProyectoF",
-        port=3306
-    )
-    print(f"Conexión exitosa a la base de datos MySQL")
-except mysql.connector.Error as err:
-    print(f"Error al conectar a la base de datos: {err}")
-
-mycursor = db_config.cursor()
-
+#todo ----------- Models -----------
 
 #* ----------- USUARIO Model-----------
 class Usuario(BaseModel):
     id: int
-    username: str
+    nombre: str
     email: EmailStr
     password: Annotated[str, StringConstraints(min_length=10)]
     cargo: str
@@ -106,42 +86,7 @@ class LoginModel(BaseModel):
 
 
 
-#* ----------- Logica de autenticacion y hasheo de passwd -----------
-def verify_password(plain_password, hashed_password):
-    return pwd_context.verify(plain_password, hashed_password)
-
-def get_password_hash(password):
-    return pwd_context.hash(password)
-
-def create_access_token(data: dict, expires_delta: timedelta | None = None):
-    to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
-
-
-
-def get_current_user(token: str = Depends(oauth2_scheme)):
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="No se pudo validar las credenciales",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        email: str = payload.get("sub")
-        if email is None:
-            raise credentials_exception
-    except JWTError:
-        raise credentials_exception
-    mycursor.execute("SELECT id, nombre, email FROM autenticator WHERE email = %s", (email,))
-    user = mycursor.fetchone()
-    if user is None:
-        raise credentials_exception
-    return {"id": user[0], "nombre": user[1], "email": user[2]}
-
-# --------- FIN Auth -------------
+#todo --------- ENDPOINTS -------------
 
 #! -------- GET ALL -------------
 #* Endpoint para obtener todos los usuarios
@@ -218,8 +163,15 @@ def get_venta(id: int, current_user: dict = Depends(get_current_user)):
 #* Endpoint para crear un nuevo usuario
 @app.post("/usuarios", tags=["usuario"])
 def create_usuario(usuario: Usuario):
-    sql = "INSERT INTO usuario (username, email, password, cargo) VALUES (%s, %s, %s, %s)"
-    val = (usuario.username, usuario.email, usuario.password, usuario.cargo)
+    # Verificar si el email ya existe
+    mycursor.execute("SELECT id FROM usuario WHERE email = %s", (usuario.email,))
+    if mycursor.fetchone():
+        return {"error": "El email ya está registrado"}
+    # Validar longitud de la contraseña
+    if len(usuario.password) < 10:
+        return {"error": "La contraseña debe tener al menos 10 caracteres"}
+    sql = "INSERT INTO usuario (nombre, email, password, cargo) VALUES (%s, %s, %s, %s)"
+    val = (usuario.nombre, usuario.email, usuario.password, usuario.cargo)
     try:
         mycursor.execute(sql, val)
         db_config.commit()
@@ -251,36 +203,51 @@ def create_producto(producto: Producto):
         return {"error": f"Error al insertar producto: {err}"}
     return {"message": "Producto creado exitosamente", "producto": producto}
 
-#* Endpoint para registrar usuario en autenticator
-@app.post("/auth/register", tags=["autenticador"])
-def register(user: RegisterModel):
-    hashed_password = get_password_hash(user.passwd)
-    sql = "INSERT INTO autenticator (nombre, email, passwd) VALUES (%s, %s, %s)"
-    val = (user.nombre, user.email, hashed_password)
+
+#* Endpoint para crear una nueva venta (protegido)
+@app.post("/ventas", tags=["venta"])
+def create_venta(venta: Venta, current_user: dict = Depends(get_current_user)):
+    mycursor, db_config = get_db_cursor()
+    # Verificar stock disponible antes de registrar la venta
+    mycursor.execute("SELECT stock FROM producto WHERE id = %s", (venta.producto_id,))
+    result = mycursor.fetchone()
+    if not result:
+        return {"error": "Producto no encontrado"}
+    stock_disponible = result[0]
+    if stock_disponible < venta.cantidad:
+        return {"error": "Stock insuficiente para la venta"}
+    # Registrar la venta
+    sql = "INSERT INTO venta (fecha, producto_id, cliente_id, usuario_id, cantidad, precio_unitario, total) VALUES (%s, %s, %s, %s, %s, %s, %s)"
+    val = (venta.fecha, venta.producto_id, venta.cliente_id, current_user['id'], venta.cantidad, venta.precio_unitario, venta.total)
     try:
         mycursor.execute(sql, val)
         db_config.commit()
     except mysql.connector.Error as err:
-        return {"error": f"Error al registrar: {err}"}
-    return {"message": "Usuario registrado exitosamente"}
+        return {"error": f"Error al insertar venta: {err}"}
+    # Actualizar el stock del producto
+    nuevo_stock = stock_disponible - venta.cantidad
+    mycursor.execute("UPDATE producto SET stock = %s WHERE id = %s", (nuevo_stock, venta.producto_id))
+    db_config.commit()
+    return {"message": "Venta creada exitosamente", "venta": venta}
+
+
+#* Endpoint para registrar usuario en autenticator
+@app.post("/auth/register", tags=["autenticador"])
+def register(user: RegisterModel):
+    return auth_register(user)
 
 # Endpoint para login y obtener token
 @app.post("/auth/login", tags=["autenticador"])
 def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    mycursor.execute("SELECT id, nombre, email, passwd FROM autenticator WHERE email = %s", (form_data.username,))
-    user = mycursor.fetchone()
-    if not user or not verify_password(form_data.password, user[3]):
-        raise HTTPException(status_code=400, detail="Email o contraseña incorrectos")
-    access_token = create_access_token(data={"sub": user[2]})
-    return {"access_token": access_token, "token_type": "bearer"}
+    return auth_login(form_data)
 
 
 #! --------- PUT ALL -------------
 #* Endpoint para actualizar un usuario
 @app.put("/usuarios/{id}", tags=["usuario"])
 def update_usuario(id: int, usuario: Usuario):
-    sql = "UPDATE usuario SET username = %s, email = %s, password = %s, cargo = %s WHERE id = %s"
-    val = (usuario.username, usuario.email, usuario.password, usuario.cargo, id)
+    sql = "UPDATE usuario SET nombre = %s, email = %s, password = %s, cargo = %s WHERE id = %s"
+    val = (usuario.nombre, usuario.email, usuario.password, usuario.cargo, id)
     try:
         mycursor.execute(sql, val)
         db_config.commit()
