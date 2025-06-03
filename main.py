@@ -203,12 +203,11 @@ def create_producto(producto: Producto):
         return {"error": f"Error al insertar producto: {err}"}
     return {"message": "Producto creado exitosamente", "producto": producto}
 
-
 #* Endpoint para crear una nueva venta (protegido)
 @app.post("/ventas", tags=["venta"])
 def create_venta(venta: Venta, current_user: dict = Depends(get_current_user)):
     mycursor, db_config = get_db_cursor()
-    # Verificar stock disponible antes de registrar la venta
+    # Verificar stock disponible
     mycursor.execute("SELECT stock FROM producto WHERE id = %s", (venta.producto_id,))
     result = mycursor.fetchone()
     if not result:
@@ -216,19 +215,31 @@ def create_venta(venta: Venta, current_user: dict = Depends(get_current_user)):
     stock_disponible = result[0]
     if stock_disponible < venta.cantidad:
         return {"error": "Stock insuficiente para la venta"}
-    # Registrar la venta
-    sql = "INSERT INTO venta (fecha, producto_id, cliente_id, usuario_id, cantidad, precio_unitario, total) VALUES (%s, %s, %s, %s, %s, %s, %s)"
-    val = (venta.fecha, venta.producto_id, venta.cliente_id, current_user['id'], venta.cantidad, venta.precio_unitario, venta.total)
+    
+    sql = """
+        INSERT INTO venta (fecha, producto_id, cliente_id, usuario_id, cantidad, precio_unitario, total)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+    """
+    val = (
+        venta.fecha,
+        venta.producto_id,
+        venta.cliente_id,
+        venta.usuario_id,  
+        venta.cantidad,
+        venta.precio_unitario,
+        venta.total
+    )
     try:
         mycursor.execute(sql, val)
         db_config.commit()
+        # Actualizar el stock SOLO si la venta fue exitosa
+        nuevo_stock = stock_disponible - venta.cantidad
+        mycursor.execute("UPDATE producto SET stock = %s WHERE id = %s", (nuevo_stock, venta.producto_id))
+        db_config.commit()
     except mysql.connector.Error as err:
         return {"error": f"Error al insertar venta: {err}"}
-    # Actualizar el stock del producto
-    nuevo_stock = stock_disponible - venta.cantidad
-    mycursor.execute("UPDATE producto SET stock = %s WHERE id = %s", (nuevo_stock, venta.producto_id))
-    db_config.commit()
     return {"message": "Venta creada exitosamente", "venta": venta}
+
 
 
 #* Endpoint para registrar usuario en autenticator
@@ -236,7 +247,7 @@ def create_venta(venta: Venta, current_user: dict = Depends(get_current_user)):
 def register(user: RegisterModel):
     return auth_register(user)
 
-# Endpoint para login y obtener token
+#* Endpoint para login y obtener token
 @app.post("/auth/login", tags=["autenticador"])
 def login(form_data: OAuth2PasswordRequestForm = Depends()):
     return auth_login(form_data)
